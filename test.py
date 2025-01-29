@@ -36,6 +36,7 @@ class CustomImageDataset(torch.utils.data.Dataset):
         return image, label, image_path.name  # ラベルとファイル名を返す
 
 # モデルのロード
+# モデルのロード
 def load_model(weights_path="weights.pth", center_path="center.pth", device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,21 +52,23 @@ def load_model(weights_path="weights.pth", center_path="center.pth", device=None
         nn.Linear(1024, 32),
         nn.Sigmoid()
     )
-    model.load_state_dict(torch.load(weights_path))
+
+    # `weights_only=True` を明示的に指定してロード
+    model.load_state_dict(torch.load(weights_path, weights_only=True))
     model = model.to(device)
     model.eval()
 
-    center = torch.load(center_path).to(device)
+    center = torch.load(center_path, weights_only=True).to(device)
 
     return model, center, device
 
 # 異常検知関数
-def detect_anomaly(model, center, dataloader, dataset_type="", threshold=0.1):
+def detect_anomaly(model, center, dataloader, device, dataset_type="", threshold=0.1):
     print(f"\nDetecting anomalies in {dataset_type} dataset:")
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc=f"Processing {dataset_type}", leave=False)
         for images, labels, image_names in progress_bar:
-            images = images.to(model.device)
+            images = images.to(device)  # 修正: 明示的に device を使用
             outputs = model(images)
 
             # 超球中心との距離を計算
@@ -84,8 +87,8 @@ def main():
 
     model, center, device = load_model()
 
-    detect_anomaly(model, center, test_normal_loader, "normal")
-    detect_anomaly(model, center, test_anomaly_loader, "anomaly")
+    detect_anomaly(model, center, test_normal_loader, device, "normal")
+    detect_anomaly(model, center, test_anomaly_loader, device, "anomaly")
 
 if __name__ == "__main__":
     main()

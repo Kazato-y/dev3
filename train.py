@@ -34,7 +34,7 @@ class CustomImageDataset(torch.utils.data.Dataset):
             image = self.transform(image)
         return image, torch.zeros(1)  # ダミーラベル
 
-train_dataset = CustomImageDataset("dataset/train", transform=transform)
+train_dataset = CustomImageDataset("dataset/train/normal", transform=transform)
 
 # データ分割（80%: トレーニング、20%: 検証）
 train_size = int(0.8 * len(train_dataset))
