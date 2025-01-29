@@ -1,10 +1,10 @@
 import torch
-from torch.utils.data import DataLoader, random_split
 from torchvision import transforms, models
 from torchvision.models import VGG16_Weights
 import torch.nn as nn
-from PIL import ImageFile, Image
 from pathlib import Path
+from PIL import ImageFile, Image
+from tqdm import tqdm  # 進捗バー用
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -30,97 +30,62 @@ class CustomImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         image = Image.open(image_path).convert("RGB")
+        label = "anomaly" if "anomaly" in image_path.parts else "normal"  # パス名でラベルを判断
         if self.transform:
             image = self.transform(image)
-        return image, torch.zeros(1)  # ダミーラベル
+        return image, label, image_path.name  # ラベルとファイル名を返す
 
-train_dataset = CustomImageDataset("dataset/train", transform=transform)
+# モデルのロード
+def load_model(weights_path="weights.pth", center_path="center.pth", device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# データ分割（80%: トレーニング、20%: 検証）
-train_size = int(0.8 * len(train_dataset))
-val_size = len(train_dataset) - train_size
-train_data, val_data = random_split(train_dataset, [train_size, val_size])
-train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
-
-# モデルの初期化
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = models.vgg16(weights=VGG16_Weights.DEFAULT)
-for param in model.features.parameters():
-    param.requires_grad = False
-
-# `classifier` をカスタマイズ
-model.classifier = nn.Sequential(
-    nn.Linear(25088, 4096),
-    nn.ReLU(inplace=True),
-    nn.Dropout(0.5),
-    nn.Linear(4096, 1024),
-    nn.ReLU(inplace=True),
-    nn.Dropout(0.5),
-    nn.Linear(1024, 32),
-    nn.Sigmoid()
-)
-model = model.to(device)
-
-# 損失関数とオプティマイザ
-criterion = torch.nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)  # 学習率スケジューラ
-
-# 超球の中心点計算
-center = torch.zeros(32).to(device)
-with torch.no_grad():
-    for images, _ in train_loader:
-        images = images.to(device)
-        outputs = model(images)
-        center += outputs.sum(dim=0)
-    center /= len(train_loader.dataset)  # 中心点の平均
-
-# 早期停止の設定
-best_loss = float('inf')
-patience = 5
-no_improve_epochs = 0
-
-# 学習プロセス
-for epoch in range(50):  # 最大 50 エポック
-    model.train()
-    train_loss = 0.0
-    for images, _ in train_loader:
-        images = images.to(device)
-        outputs = model(images)
-
-        # 損失の計算
-        loss = criterion(outputs, center.unsqueeze(0).expand_as(outputs))
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item()
-
-    train_loss /= len(train_loader)
-
-    # 検証プロセス
+    model = models.vgg16(weights=VGG16_Weights.DEFAULT)
+    model.classifier = nn.Sequential(
+        nn.Linear(25088, 4096),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.5),
+        nn.Linear(4096, 1024),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.5),
+        nn.Linear(1024, 32),
+        nn.Sigmoid()
+    )
+    model.load_state_dict(torch.load(weights_path))
+    model = model.to(device)
     model.eval()
-    val_loss = 0.0
+
+    center = torch.load(center_path).to(device)
+
+    return model, center, device
+
+# 異常検知関数
+def detect_anomaly(model, center, dataloader, dataset_type="", threshold=0.1):
+    print(f"\nDetecting anomalies in {dataset_type} dataset:")
     with torch.no_grad():
-        for images, _ in val_loader:
-            images = images.to(device)
+        progress_bar = tqdm(dataloader, desc=f"Processing {dataset_type}", leave=False)
+        for images, labels, image_names in progress_bar:
+            images = images.to(model.device)
             outputs = model(images)
-            loss = criterion(outputs, center.unsqueeze(0).expand_as(outputs))
-            val_loss += loss.item()
 
-    val_loss /= len(val_loader)
-    scheduler.step()
+            # 超球中心との距離を計算
+            distances = torch.norm(outputs - center.unsqueeze(0), dim=1)
+            for image_name, label, distance in zip(image_names, labels, distances):
+                result = "Anomalous" if distance > threshold else "Normal"
+                print(f"{image_name} ({label}): {result} (Distance: {distance:.4f})")
 
-    print(f"Epoch {epoch + 1}, Training Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}")
+# `test.py` を直接実行した場合のみ動作する処理
+def main():
+    test_normal_dataset = CustomImageDataset("dataset/test/normal", transform=transform)
+    test_anomaly_dataset = CustomImageDataset("dataset/test/anomaly", transform=transform)
 
-    # 早期停止のチェック
-    if val_loss < best_loss:
-        best_loss = val_loss
-        torch.save(model.state_dict(), "best_model.pth")
-        torch.save(center, "center.pth")
-        no_improve_epochs = 0
-    else:
-        no_improve_epochs += 1
-        if no_improve_epochs >= patience:
-            print("Early stopping!")
-            break
+    test_normal_loader = torch.utils.data.DataLoader(test_normal_dataset, batch_size=4, shuffle=False)
+    test_anomaly_loader = torch.utils.data.DataLoader(test_anomaly_dataset, batch_size=4, shuffle=False)
+
+    model, center, device = load_model()
+
+    detect_anomaly(model, center, test_normal_loader, "normal")
+    detect_anomaly(model, center, test_anomaly_loader, "anomaly")
+
+if __name__ == "__main__":
+    main()

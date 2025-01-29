@@ -1,13 +1,10 @@
-from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from torchvision import models
-import torch.nn as nn
-from PIL import Image
-from PIL import ImageFile
-import numpy as np
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms, models
 from torchvision.models import VGG16_Weights
+import torch.nn as nn
+from PIL import ImageFile, Image
+from pathlib import Path
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -23,7 +20,6 @@ class CustomImageDataset(torch.utils.data.Dataset):
     def __init__(self, image_dir, transform=None):
         self.image_dir = Path(image_dir)
         self.transform = transform
-        # 大文字小文字を区別せずに画像を取得
         self.image_paths = list(self.image_dir.glob("*.jpg")) + list(self.image_dir.glob("*.JPG"))
         if len(self.image_paths) == 0:
             raise ValueError(f"No images found in {self.image_dir}")
@@ -36,14 +32,28 @@ class CustomImageDataset(torch.utils.data.Dataset):
         image = Image.open(image_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        return image, torch.zeros(1)  # 正常データ用のダミーラベル
-    
-train_dataset = CustomImageDataset("dataset/train/normal", transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+        return image, torch.zeros(1)  # ダミーラベル
 
+train_dataset = CustomImageDataset("dataset/train", transform=transform)
+
+# データ分割（80%: トレーニング、20%: 検証）
+train_size = int(0.8 * len(train_dataset))
+val_size = len(train_dataset) - train_size
+train_data, val_data = random_split(train_dataset, [train_size, val_size])
+train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
+
+# CUDAの使用可否を確認
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("CUDA is not available. Using CPU.")
+
+# 写真の枚数を出力
+print(f"Number of training images: {len(train_dataset)}")
 
 # モデルの初期化
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = models.vgg16(weights=VGG16_Weights.DEFAULT)
 for param in model.features.parameters():
     param.requires_grad = False
@@ -59,27 +69,31 @@ model.classifier = nn.Sequential(
     nn.Linear(1024, 32),
     nn.Sigmoid()
 )
-
-# モデルをGPUに転送
 model = model.to(device)
 
 # 損失関数とオプティマイザ
-
 criterion = torch.nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)  # 学習率スケジューラ
 
-# 学習プロセス
-model.train()
-center = torch.zeros(32).to(device)  # 超球の中心点
+# 超球の中心点計算
+center = torch.zeros(32).to(device)
 with torch.no_grad():
     for images, _ in train_loader:
         images = images.to(device)
         outputs = model(images)
         center += outputs.sum(dim=0)
-    center /= len(train_loader.dataset)  # 中心点の平均を計算
+    center /= len(train_loader.dataset)  # 中心点の平均
 
-for epoch in range(10):  # 10エポック
-    epoch_loss = 0.0
+# 早期停止の設定
+best_loss = float('inf')
+patience = 5
+no_improve_epochs = 0
+
+# 学習プロセス
+for epoch in range(50):  # 最大 50 エポック
+    model.train()
+    train_loss = 0.0
     for images, _ in train_loader:
         images = images.to(device)
         outputs = model(images)
@@ -89,11 +103,41 @@ for epoch in range(10):  # 10エポック
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        train_loss += loss.item()
 
-        epoch_loss += loss.item()
+    train_loss /= len(train_loader)
 
-    print(f"Epoch {epoch + 1}, Loss: {epoch_loss:.4f}")
+    # 検証プロセス
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for images, _ in val_loader:
+            images = images.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, center.unsqueeze(0).expand_as(outputs))
+            val_loss += loss.item()
 
-# モデルと中心点を保存
-torch.save(model.state_dict(), "deep_svdd_model.pth")
-torch.save(center, "center.pth")
+    val_loss /= len(val_loader)
+    scheduler.step()
+
+    print(f"Epoch {epoch + 1}, Training Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}")
+
+    # 早期停止のチェック
+    if val_loss < best_loss:
+        best_loss = val_loss
+
+        # **モデルごと保存**
+        torch.save(model, "best_model.pth")
+
+        # **重みだけ保存**
+        torch.save(model.state_dict(), "weights.pth")
+
+        # **超球の中心点保存**
+        torch.save(center, "center.pth")
+
+        no_improve_epochs = 0
+    else:
+        no_improve_epochs += 1
+        if no_improve_epochs >= patience:
+            print("Early stopping!")
+            break
